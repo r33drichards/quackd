@@ -22,12 +22,20 @@ Policies:
              (`search_scan`, `walk_to`, `kick`) through the real agent loop. A different
              action space, so it has no per-step trace, only the end-of-episode verdict.
 
+Two simulators, `--sim`: `sim2d`, the flat cartoon that is quackd's default, and `mujoco`,
+the 3D physics simulator with upstream's own Microduck model walking on upstream's trained
+policy (`--body microduck`) or the kinematic stand-in (`--body puppet`). Each has its own
+action timings (`Sim.twist`, `Sim.action_s`), because the real gait barely moves on a half
+second command. A duck that falls over ends its episode: nothing in these four actions stands
+it back up.
+
 Success is the bar `ducks/find-and-kick.duck` sets: a kick that connected and a ball that ended
 at least 0.3 m from where it started. Pushing the ball with the body can move it too, which is
 reported separately (`displaced`) and does not count.
 
     uv run python scripts/eval_microduck.py --policy laya random blob oracle pilot --seeds 0-9
     uv run python scripts/eval_microduck.py --policy laya --seeds 0 --video runs/eval/laya-seed0.mp4
+    MUJOCO_GL=osmesa uv run python scripts/eval_microduck.py --sim mujoco --policy teacher random
 
 Laya Vision is not a quackd dependency: install it next to quackd (`uv pip install -e
 ../laya-vision torchvision "transformers>=5.3"`). `--video` needs `imageio` and
@@ -69,13 +77,73 @@ ACTIONS = {
 }
 TWIST = {"FORWARD": (0.25, 0.0, 0.0), "LEFT": (0.0, 0.0, 0.6), "RIGHT": (0.0, 0.0, -0.6)}
 ACTION_S = 0.5
-"""Sim seconds one move lasts: 0.125 m forward, or about 17 degrees of turn."""
+"""sim2d: sim seconds one move lasts, 0.125 m forward or about 17 degrees of turn."""
 RESEND_S = 0.2
 """The world stops a duck whose last move is older than 0.3 s (upstream's deadman)."""
 KICK_SETTLE_S = 1.5
 """After a kick, time for the ball to roll before the next picture."""
 SUCCESS_M = 0.3
 """`ducks/find-and-kick.duck`: "Ball displaced more than 0.3 m"."""
+TURN_DEADBAND_DEG = 20.0
+"""`steer` turns while the ball is further off the heading than this."""
+
+
+@dataclass(frozen=True)
+class Sim:
+    """One simulator: how to build it, what its cameras draw, and what an action means in it."""
+
+    name: str
+    twist: dict[str, tuple[float, float, float]]
+    action_s: dict[str, float]
+    """Sim seconds each move lasts."""
+    kick_settle_s: float
+    body: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.name if self.body is None else f"{self.name}:{self.body}"
+
+    def transport(self, seed: int) -> Any:
+        if self.name == "sim2d":
+            return Sim2DTransport(seed=seed)
+        from quackd_microduck.transports.mujoco import MujocoTransport
+
+        return MujocoTransport(seed=seed, body=self.body or "microduck")
+
+    def cam(self, world: Any, size: int = 256) -> Image.Image:
+        if self.name == "sim2d":
+            return render_duckcam(world, size)
+        from quackd_microduck.sim3d.render import render_headcam
+
+        return render_headcam(world, size)
+
+    def top(self, world: Any, size: int = 256) -> Image.Image:
+        if self.name == "sim2d":
+            return render_topdown(world, size)
+        from quackd_microduck.sim3d.render import render_overview
+
+        return render_overview(world, size)
+
+
+SIM2D = Sim("sim2d", TWIST, {a: ACTION_S for a in TWIST}, KICK_SETTLE_S)
+
+
+def mujoco_sim(body: str = "microduck") -> Sim:
+    """The real gait needs about a second to get going and turns in uneven lurches, so its
+    moves are longer than the cartoon's; a turn is kept short enough that one of them cannot
+    carry the ball from one side of `TURN_DEADBAND_DEG` to the other."""
+    return Sim(
+        "mujoco",
+        {"FORWARD": (0.3, 0.0, 0.0), "LEFT": (0.0, 0.0, 0.8), "RIGHT": (0.0, 0.0, -0.8)},
+        {"FORWARD": 1.0, "LEFT": 0.6, "RIGHT": 0.6},
+        KICK_SETTLE_S,
+        body,
+    )
+
+
+def make_sim(name: str, body: str = "microduck") -> Sim:
+    return SIM2D if name == "sim2d" else mujoco_sim(body)
+
 
 QUESTION_TEXT = {
     "cam": (
@@ -126,15 +194,33 @@ class Truth:
     kicks_connected: int
 
 
-def read_truth(world: World) -> Truth:
-    d = world.ducks[0]
-    dist, bearing = world.relative(world.ball.x, world.ball.y)
-    cam_dist, cam_bearing = world.relative(world.ball.x, world.ball.y, camera=True)
+def ball_xy(world: Any) -> tuple[float, float]:
+    """The ball, in either world: sim2d keeps a `Ball`, the physics world reads its joint."""
+    if hasattr(world, "ball"):
+        return world.ball.x, world.ball.y
+    return world.ball_x, world.ball_y
+
+
+def duck_pose(world: Any) -> tuple[float, float, float]:
+    d = world.ducks[0] if hasattr(world, "ducks") else world
+    return d.x, d.y, d.theta
+
+
+def fallen(world: Any) -> bool:
+    d = world.ducks[0] if hasattr(world, "ducks") else world
+    return d.posture == "fallen"
+
+
+def read_truth(world: Any) -> Truth:
+    x, y, theta = duck_pose(world)
+    bx, by = ball_xy(world)
+    dist, bearing = world.relative(bx, by)
+    cam_dist, cam_bearing = world.relative(bx, by, camera=True)
     bearing_deg = math.degrees(bearing)
     return Truth(
         t=round(world.t, 3),
-        duck=(round(d.x, 3), round(d.y, 3), round(d.theta, 3)),
-        ball=(round(world.ball.x, 3), round(world.ball.y, 3)),
+        duck=(round(x, 3), round(y, 3), round(theta, 3)),
+        ball=(round(bx, 3), round(by, 3)),
         dist_m=round(dist, 3),
         bearing_deg=round(bearing_deg, 1),
         in_view=abs(math.degrees(cam_bearing)) <= 45.0 and cam_dist > 0,
@@ -172,7 +258,7 @@ def steer(bearing_deg: float, dist_m: float) -> str:
     """Turn to the ball, walk up, kick: the controller both scripted policies share."""
     # the deadband is wider than one turn (17 degrees), or the controller rocks across it
     # forever, and narrower than the kick cone (35), so a ball it walks up to is kickable
-    if abs(bearing_deg) > 20.0:
+    if abs(bearing_deg) > TURN_DEADBAND_DEG:
         return "LEFT" if bearing_deg > 0 else "RIGHT"
     if dist_m > 0.22:
         return "FORWARD"
@@ -188,7 +274,7 @@ class OraclePolicy:
         pass
 
     def act(self, world, cam, top):
-        dist, bearing = world.relative(world.ball.x, world.ball.y)
+        dist, bearing = world.relative(*ball_xy(world))
         return steer(math.degrees(bearing), dist), {}
 
 
@@ -200,7 +286,7 @@ def teacher_action(world: World) -> str:
     `collect_microduck_rollouts.py` writes."""
     if not read_truth(world).in_view:
         return "LEFT"
-    dist, bearing = world.relative(world.ball.x, world.ball.y)
+    dist, bearing = world.relative(*ball_xy(world))
     return steer(math.degrees(bearing), dist)
 
 
@@ -291,6 +377,8 @@ class Episode:
     ball_displacement_m: float
     ball_in_view_frac: float | None
     kickable_frac: float | None
+    fell: bool = False
+    """The duck fell over, which ends the episode."""
     actions: dict[str, int] = field(default_factory=dict)
     decision_ms: float | None = None
     trace: list[dict[str, Any]] = field(default_factory=list)
@@ -299,8 +387,11 @@ class Episode:
 class Video:
     """World | duck cam | the decision, one frame every `every_s` of sim time."""
 
-    def __init__(self, transport: Sim2DTransport, size: int = 320, every_s: float = 0.1) -> None:
+    def __init__(
+        self, transport: Any, sim: Sim = SIM2D, size: int = 320, every_s: float = 0.1
+    ) -> None:
         self.transport = transport
+        self.sim = sim
         self.size = size
         self.every_s = every_s
         self.frames: list[Image.Image] = []
@@ -318,8 +409,8 @@ class Video:
         s = self.size
         panel_w = 200
         frame = Image.new("RGB", (2 * s + panel_w + 8, s + 28), (24, 24, 28))
-        frame.paste(render_topdown(world, s), (0, 28))
-        frame.paste(render_duckcam(world, s), (s + 4, 28))
+        frame.paste(self.sim.top(world, s), (0, 28))
+        frame.paste(self.sim.cam(world, s), (s + 4, 28))
         draw = ImageDraw.Draw(frame)
         draw.text((6, 8), f"t={world.t:5.1f}s  {self.caption}", fill=(235, 235, 235))
         draw.text((s + 10, 8), "duck cam", fill=(170, 170, 170))
@@ -358,9 +449,9 @@ class Video:
         return path
 
 
-async def move(transport: Sim2DTransport, action: str) -> None:
-    vx, vy, wz = TWIST[action]
-    left = ACTION_S
+async def move(transport: Any, action: str, sim: Sim = SIM2D) -> None:
+    vx, vy, wz = sim.twist[action]
+    left = sim.action_s[action]
     while left > 1e-9:
         await transport.send_intent(Intent.move(vx, vy, wz))
         chunk = min(RESEND_S, left)
@@ -374,9 +465,10 @@ async def run_episode(
     seed: int,
     max_steps: int,
     video: Video | None = None,
-    transport: Sim2DTransport | None = None,
+    transport: Any = None,
+    sim: Sim = SIM2D,
 ) -> Episode:
-    transport = transport or Sim2DTransport(seed=seed)
+    transport = transport or sim.transport(seed)
     await transport.connect()
     world = transport.world
     policy.reset(seed)
@@ -395,8 +487,8 @@ async def run_episode(
             kickable += before.kickable
             if before.kickable and first_kickable is None:
                 first_kickable = step
-            cam = render_duckcam(world, 256)
-            top = render_topdown(world, 256)
+            cam = sim.cam(world, 256)
+            top = sim.top(world, 256)
             t0 = time.perf_counter()
             action, probs = policy.act(world, cam, top)
             ms.append((time.perf_counter() - t0) * 1000)
@@ -407,9 +499,9 @@ async def run_episode(
                 video.probs = probs
             if action == "KICK":
                 await transport.send_intent(Intent.do("kick_right"))
-                await transport.sleep(KICK_SETTLE_S)
+                await transport.sleep(sim.kick_settle_s)
             else:
-                await move(transport, action)
+                await move(transport, action, sim)
             after = read_truth(world)
             min_dist = min(min_dist, after.dist_m)
             trace.append(
@@ -423,10 +515,14 @@ async def run_episode(
             )
             if after.kicks_connected and after.displacement_m >= SUCCESS_M:
                 break
+            if fallen(world):
+                break
     finally:
+        # read before closing: the physics world frees its model on close
+        end = read_truth(world)
+        fell = fallen(world)
         await transport.close()
         await transport.clock.stop()
-    end = read_truth(world)
     return Episode(
         policy=policy.name,
         seed=seed,
@@ -445,6 +541,7 @@ async def run_episode(
         ball_displacement_m=end.displacement_m,
         ball_in_view_frac=round(seen / steps, 3) if steps else None,
         kickable_frac=round(kickable / steps, 3) if steps else None,
+        fell=fell,
         actions=dict(counts),
         decision_ms=round(statistics.median(ms), 1) if ms else None,
         trace=trace,
@@ -518,6 +615,7 @@ def summarise(episodes: list[Episode]) -> dict[str, Any]:
         "success_rate": round(sum(e.success for e in episodes) / n, 3),
         "kicked_rate": round(sum(e.kicked for e in episodes) / n, 3),
         "displaced_rate": round(sum(e.displaced for e in episodes) / n, 3),
+        "fell_rate": round(sum(e.fell for e in episodes) / n, 3),
         "mean_progress": mean("progress"),
         "mean_min_dist_m": mean("min_dist_m"),
         "mean_final_dist_m": mean("final_dist_m"),
@@ -555,6 +653,7 @@ def table(summary: dict[str, dict[str, Any]]) -> str:
         ("success_rate", "success"),
         ("kicked_rate", "kicked"),
         ("displaced_rate", "displaced"),
+        ("fell_rate", "fell"),
         ("mean_progress", "progress"),
         ("mean_min_dist_m", "min dist m"),
         ("mean_ball_displacement_m", "ball moved m"),
@@ -587,6 +686,10 @@ async def main() -> None:
         choices=["laya", "random", "blob", "oracle", "teacher", "pilot"],
     )
     ap.add_argument("--seeds", default="0-9", help="e.g. 0-9 or 0,3,7")
+    ap.add_argument("--sim", default="sim2d", choices=["sim2d", "mujoco"])
+    ap.add_argument(
+        "--body", default="microduck", choices=["microduck", "puppet"], help="mujoco only"
+    )
     ap.add_argument(
         "--max-steps", type=int, default=60, help="decisions per episode (pilot: verbs)"
     )
@@ -612,6 +715,9 @@ async def main() -> None:
     ap.add_argument("--no-trace", action="store_true", help="leave per-step traces out of the JSON")
     args = ap.parse_args()
     seeds = parse_seeds(args.seeds)
+    sim = make_sim(args.sim, args.body)
+    if sim.name != "sim2d" and "pilot" in args.policy:
+        sys.exit("--policy pilot runs on sim2d only")
 
     policies: list[Policy | str] = []
     for name in args.policy:
@@ -641,15 +747,16 @@ async def main() -> None:
                 ep = await run_pilot(seed, args.max_steps, args.out.parent / "pilot-runs")
             else:
                 video = None
-                transport = Sim2DTransport(seed=seed)
+                transport = sim.transport(seed)
                 if args.video is not None and video_path is None:
-                    video = Video(transport)
-                ep = await run_episode(policy, seed, args.max_steps, video, transport)
+                    video = Video(transport, sim)
+                ep = await run_episode(policy, seed, args.max_steps, video, transport, sim)
                 if video is not None:
                     video_path = video.save(args.video)
             eps.append(ep)
+            verdict = "SUCCESS" if ep.success else "FELL   " if ep.fell else "fail   "
             print(
-                f"{name:12s} seed {seed}: {'SUCCESS' if ep.success else 'fail   '} "
+                f"{name:12s} seed {seed}: {verdict} "
                 f"kicked={ep.kicked} ball_moved={ep.ball_displacement_m:.2f}m "
                 f"dist {ep.start_dist_m:.2f}->{ep.min_dist_m:.2f}m steps={ep.steps} "
                 f"({time.perf_counter() - t0:.0f}s)",
@@ -660,10 +767,11 @@ async def main() -> None:
     normalise(summary)
     report = {
         "task": "find-and-kick",
-        "sim": "microduck:sim2d",
+        "sim": f"microduck:{sim.label}",
+        "twist": sim.twist,
+        "action_s": sim.action_s,
         "seeds": seeds,
         "max_steps": args.max_steps,
-        "action_s": ACTION_S,
         "success_m": SUCCESS_M,
         "model": args.model if "laya" in args.policy else None,
         "revision": args.revision,

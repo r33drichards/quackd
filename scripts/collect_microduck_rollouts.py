@@ -12,6 +12,11 @@ all bare floor, so only `--keep-blind` of them are kept. A fraction of episodes 
 start with the duck placed close to the ball, because a kick is one decision an episode and
 would otherwise be rare in the data.
 
+`--sim mujoco` collects from the 3D physics simulator instead (upstream's real Microduck on its
+trained walking policy by default, `--body puppet` for the kinematic stand-in), with that
+simulator's action timings (`eval_microduck.Sim`); an episode ends if the duck falls over.
+`--workers` runs episodes in parallel processes; the output does not depend on it.
+
 Seeds never overlap the eval's 0..9: train from `--seed-base` (1000), val from
 `--seed-base + 100000`. The output is Laya Vision's JSONL layout, the same as its game frames:
 
@@ -20,6 +25,8 @@ Seeds never overlap the eval's 0..9: train from `--seed-base` (1000), val from
     <out>/meta.json, _READY
 
     uv run python scripts/collect_microduck_rollouts.py --out runs/data/microduck_kick
+    MUJOCO_GL=osmesa uv run python scripts/collect_microduck_rollouts.py --sim mujoco \
+        --workers 4 --out runs/data/microduck3d_kick
     modal volume put laya-datasets runs/data/microduck_kick vqa/microduck_kick
 """
 
@@ -32,6 +39,7 @@ import math
 import random
 import sys
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -39,15 +47,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from eval_microduck import (  # a sibling script, not a package
     ACTIONS,
-    KICK_SETTLE_S,
     SUCCESS_M,
+    Sim,
+    ball_xy,
+    fallen,
+    make_sim,
     move,
     question,
     read_truth,
     teacher_action,
 )
 
-from quackd.sim2d.render import render_duckcam
 from quackd.sim2d.world import ARENA_HALF, DUCK_R, World
 from quackd.transport.base import Intent
 from quackd.transport.sim2d import Sim2DTransport
@@ -56,29 +66,42 @@ LABELS = list(ACTIONS)
 VAL_SEED_OFFSET = 100_000
 
 
-def place_near_ball(world: World, rng: random.Random) -> None:
-    """Put the duck 0.15 to 0.6 m from the ball, facing anywhere."""
-    duck = world.ducks[0]
+def near_ball_pose(world: Any, rng: random.Random) -> tuple[float, float, float] | None:
+    """A pose 0.15 to 0.6 m from the ball, facing anywhere, inside the walls."""
+    bx, by = ball_xy(world)
     lim = ARENA_HALF - DUCK_R
     for _ in range(100):
         r = rng.uniform(0.15, 0.6)
         a = rng.uniform(-math.pi, math.pi)
-        x, y = world.ball.x + r * math.cos(a), world.ball.y + r * math.sin(a)
+        x, y = bx + r * math.cos(a), by + r * math.sin(a)
         if abs(x) < lim and abs(y) < lim:
-            duck.x, duck.y = x, y
-            duck.theta = rng.uniform(-math.pi, math.pi)
-            return
+            return x, y, rng.uniform(-math.pi, math.pi)
+    return None
 
 
 async def episode(
     seed: int, split: str, out: Path, args: argparse.Namespace
 ) -> tuple[list[dict[str, Any]], bool]:
+    sim: Sim = make_sim(args.sim, args.body)
     rng = random.Random(seed)
-    world = World(seed=seed)
-    if rng.random() < args.near_frac:
-        place_near_ball(world, rng)
-    transport = Sim2DTransport(seed=seed, world=world)
-    await transport.connect()
+    near = rng.random() < args.near_frac
+    if sim.name == "sim2d":
+        # the world is built before the transport so the duck can be moved before it connects
+        world = World(seed=seed)
+        if near and (pose := near_ball_pose(world, rng)) is not None:
+            d = world.ducks[0]
+            d.x, d.y, d.theta = pose
+        transport = Sim2DTransport(seed=seed, world=world)
+        await transport.connect()
+    else:
+        import mujoco
+
+        transport = sim.transport(seed)
+        await transport.connect()  # the physics world only exists once connected
+        world = transport.world
+        if near and (pose := near_ball_pose(world, rng)) is not None:
+            world.body.reset(*pose)
+            mujoco.mj_forward(world.model, world.data)
     q = question("cam")["action"]
     records: list[dict[str, Any]] = []
     try:
@@ -88,7 +111,7 @@ async def episode(
             # the duck acts on every step, but a frame with no ball in it is the same bare
             # floor over and over: keeping all of them would make "turn left" most of the set
             if read_truth(world).in_view or rng.random() < args.keep_blind:
-                render_duckcam(world, 256).save(out / "images" / f"{rid}.png")
+                sim.cam(world, 256).save(out / "images" / f"{rid}.png")
                 records.append(
                     {
                         "id": rid,
@@ -105,22 +128,36 @@ async def episode(
                 action = rng.choice(["FORWARD", "LEFT", "RIGHT"])
             if action == "KICK":
                 await transport.send_intent(Intent.do("kick_right"))
-                await transport.sleep(KICK_SETTLE_S)
+                await transport.sleep(sim.kick_settle_s)
             else:
-                await move(transport, action)
+                await move(transport, action, sim)
             if world.kicks_connected and world.ball_displacement_m >= SUCCESS_M:
                 return records, True
+            if fallen(world):
+                return records, False
     finally:
         await transport.close()
         await transport.clock.stop()
     return records, False
 
 
-async def split(name: str, seeds: range, out: Path, args: argparse.Namespace) -> dict[str, Any]:
+def run_episode(
+    seed: int, split: str, out: Path, args: argparse.Namespace
+) -> tuple[list[dict[str, Any]], bool]:
+    """One episode in its own event loop: what a worker process runs."""
+    return asyncio.run(episode(seed, split, out, args))
+
+
+def split(name: str, seeds: range, out: Path, args: argparse.Namespace) -> dict[str, Any]:
+    if args.workers > 1:
+        with ProcessPoolExecutor(args.workers) as pool:
+            n = len(seeds)
+            results = list(pool.map(run_episode, seeds, [name] * n, [out] * n, [args] * n))
+    else:
+        results = [run_episode(seed, name, out, args) for seed in seeds]
     records: list[dict[str, Any]] = []
     wins = 0
-    for seed in seeds:
-        recs, won = await episode(seed, name, out, args)
+    for recs, won in results:  # in seed order whatever the worker count
         records += recs
         wins += won
     # finetune_long holds out the LAST n_calib train records for temperature fitting, so the
@@ -136,11 +173,16 @@ async def split(name: str, seeds: range, out: Path, args: argparse.Namespace) ->
     }
 
 
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--out", type=Path, default=Path("runs/data/microduck_kick"))
+    ap.add_argument("--sim", default="sim2d", choices=["sim2d", "mujoco"])
+    ap.add_argument(
+        "--body", default="microduck", choices=["microduck", "puppet"], help="mujoco only"
+    )
+    ap.add_argument("--workers", type=int, default=1, help="episodes run in parallel")
     ap.add_argument("--train-episodes", type=int, default=800)
     ap.add_argument("--val-episodes", type=int, default=80)
     ap.add_argument("--seed-base", type=int, default=1000)
@@ -158,15 +200,15 @@ async def main() -> None:
     base = args.seed_base
     meta = {
         "source": "quackd scripts/collect_microduck_rollouts.py",
-        "task": "find-and-kick, microduck:sim2d, duck camera",
+        "task": f"find-and-kick, microduck:{make_sim(args.sim, args.body).label}, duck camera",
         "teacher": "eval_microduck.teacher_action",
         "epsilon": args.epsilon,
         "near_frac": args.near_frac,
         "keep_blind": args.keep_blind,
         "max_steps": args.max_steps,
         "options": LABELS,
-        "train": await split("train", range(base, base + args.train_episodes), args.out, args),
-        "val": await split(
+        "train": split("train", range(base, base + args.train_episodes), args.out, args),
+        "val": split(
             "val",
             range(base + VAL_SEED_OFFSET, base + VAL_SEED_OFFSET + args.val_episodes),
             args.out,
@@ -179,4 +221,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
