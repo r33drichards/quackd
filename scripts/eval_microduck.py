@@ -16,6 +16,8 @@ Policies:
              detector): turn to the ball, walk up, kick. What a policy can do with no
              privileged state.
     oracle   the same controller on ground truth: the ceiling for this action space.
+    teacher  the oracle, except that it turns left whenever the ball is out of the camera's
+             view: the labels `collect_microduck_rollouts.py` trains Laya Vision on.
     pilot    quackd's own scripted pilot (`FakeProvider`) driving the composite verbs
              (`search_scan`, `walk_to`, `kick`) through the real agent loop. A different
              action space, so it has no per-step trace, only the end-of-episode verdict.
@@ -190,6 +192,30 @@ class OraclePolicy:
         return steer(math.degrees(bearing), dist), {}
 
 
+def teacher_action(world: World) -> str:
+    """`steer` on ground truth while the ball is in the camera's view, and a turn to the left
+    while it is not: the oracle, made consistent with what a camera can show. Out of view,
+    the picture cannot say which way is shorter, so a label that sometimes says left and
+    sometimes right for the same empty floor would teach nothing. These are the labels
+    `collect_microduck_rollouts.py` writes."""
+    if not read_truth(world).in_view:
+        return "LEFT"
+    dist, bearing = world.relative(world.ball.x, world.ball.y)
+    return steer(math.degrees(bearing), dist)
+
+
+class TeacherPolicy:
+    """`teacher_action`: the ceiling for a policy imitating those labels."""
+
+    name = "teacher"
+
+    def reset(self, seed: int) -> None:
+        pass
+
+    def act(self, world, cam, top):
+        return teacher_action(world), {}
+
+
 class BlobPolicy:
     """`steer` on what the camera sees, and a turn to the left while it sees nothing."""
 
@@ -212,7 +238,9 @@ class BlobPolicy:
 
 
 class LayaPolicy:
-    def __init__(self, model: str, view: str, revision: str | None = None) -> None:
+    def __init__(
+        self, model: str, view: str, revision: str | None = None, label: str = "laya"
+    ) -> None:
         import laya  # laya-vision, not the text-only `laya` on PyPI: it has `load_vlm`
 
         if not hasattr(laya, "load_vlm"):
@@ -224,7 +252,7 @@ class LayaPolicy:
         self.agent = laya.load_vlm(model, revision=revision)
         self.view = view
         self.q = question(view)
-        self.name = f"laya[{view}]"
+        self.name = f"{label}[{view}]"
 
     def reset(self, seed: int) -> None:
         pass
@@ -556,7 +584,7 @@ async def main() -> None:
         "--policy",
         nargs="+",
         default=["laya", "random", "blob", "oracle", "pilot"],
-        choices=["laya", "random", "blob", "oracle", "pilot"],
+        choices=["laya", "random", "blob", "oracle", "teacher", "pilot"],
     )
     ap.add_argument("--seeds", default="0-9", help="e.g. 0-9 or 0,3,7")
     ap.add_argument(
@@ -564,6 +592,7 @@ async def main() -> None:
     )
     ap.add_argument("--model", default="thaitea/laya-vision")
     ap.add_argument("--revision", default=None)
+    ap.add_argument("--label", default="laya", help="the name laya's rows are reported under")
     ap.add_argument(
         "--view",
         nargs="+",
@@ -587,7 +616,9 @@ async def main() -> None:
     policies: list[Policy | str] = []
     for name in args.policy:
         if name == "laya":
-            policies.extend(LayaPolicy(args.model, view, args.revision) for view in args.view)
+            policies.extend(
+                LayaPolicy(args.model, view, args.revision, args.label) for view in args.view
+            )
         elif name == "pilot":
             policies.append("pilot")
         else:
@@ -595,6 +626,7 @@ async def main() -> None:
                 "random": RandomPolicy,
                 "blob": BlobPolicy,
                 "oracle": OraclePolicy,
+                "teacher": TeacherPolicy,
             }
             policies.append(simple[name]())
 
