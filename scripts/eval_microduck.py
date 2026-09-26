@@ -712,6 +712,12 @@ async def main() -> None:
         default=None,
         help="record the first seed of the first policy to this .mp4 (not the pilot)",
     )
+    ap.add_argument(
+        "--video-dir",
+        type=Path,
+        default=None,
+        help="record every episode (not the pilot's) to DIR/<policy>-<sim>-seed<N>.mp4",
+    )
     ap.add_argument("--no-trace", action="store_true", help="leave per-step traces out of the JSON")
     args = ap.parse_args()
     seeds = parse_seeds(args.seeds)
@@ -748,11 +754,15 @@ async def main() -> None:
             else:
                 video = None
                 transport = sim.transport(seed)
-                if args.video is not None and video_path is None:
+                first = args.video is not None and video_path is None
+                if first or args.video_dir is not None:
                     video = Video(transport, sim)
                 ep = await run_episode(policy, seed, args.max_steps, video, transport, sim)
-                if video is not None:
+                if video is not None and first:
                     video_path = video.save(args.video)
+                if video is not None and args.video_dir is not None:
+                    stem = f"{name.replace('[', '-').replace(']', '')}-{sim.name}-seed{seed}"
+                    video.save(args.video_dir / f"{stem}.mp4")
             eps.append(ep)
             verdict = "SUCCESS" if ep.success else "FELL   " if ep.fell else "fail   "
             print(
